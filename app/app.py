@@ -1,202 +1,180 @@
-from flask import Flask, request, jsonify
-from flask_jwt_extended import JWTManager, jwt_required, create_access_token
-import boto3
-from botocore.exceptions import NoCredentialsError
-import os
+from flask import Flask, request, send_file, jsonify
 from werkzeug.utils import secure_filename
-from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from functools import wraps
 from minio import Minio
-from pydantic_settings import BaseSettings
-import uuid
 import requests
-from typing import Optional
+import json
+import os
+import uuid
+import io
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config.from_object("config.Config")
-jwt = JWTManager(app)
 
-s3 = boto3.client(
-    "s3",
-    endpoint_url=app.config["S3_ENDPOINT"],
-    aws_access_key_id=app.config["S3_ACCESS_KEY"],
-    aws_secret_access_key=app.config["S3_SECRET_KEY"],
-)
+MINIO_ENDPOINT = "minio:9000"
+MINIO_ACCESS_KEY = "minioadmin"
+MINIO_SECRET_KEY = "minioadmin"
+BUCKET_NAME = "files"
+KEYCLOAK_URL = "http://keycloak:8080"
+REALM_NAME = "my-realm"
+CLIENT_ID = "my-app"
+CLIENT_SECRET = "client-secret"
 
-class Settings(BaseSettings):
-    MINIO_ROOT_USER: str = "minioadmin"
-    MINIO_ROOT_PASSWORD: str = "minioadmin"
-    MINIO_ENDPOINT: str = "minio:9000"
-    MINIO_BUCKET: str = "files"
-    
-    KEYCLOAK_URL: str = "http://keycloak:8080"
-    KEYCLOAK_REALM: str = "myrealm"
-    KEYCLOAK_CLIENT_ID: str = "myclient"
-    KEYCLOAK_CLIENT_SECRET: str = "your-client-secret"
-
-    class Config:
-        env_file = ".env"
-
-settings = Settings()
-
-
-app = FastAPI(title="File Management API")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 minio_client = Minio(
-    settings.MINIO_ENDPOINT,
-    access_key=settings.MINIO_ROOT_USER,
-    secret_key=settings.MINIO_ROOT_PASSWORD,
+    MINIO_ENDPOINT,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
     secure=False
 )
 
+try:
+    if not minio_client.bucket_exists(BUCKET_NAME):
+        minio_client.make_bucket(BUCKET_NAME)
+        logger.info(f"Created bucket: {BUCKET_NAME}")
+except Exception as e:
+    logger.error(f"Error with bucket creation: {str(e)}")
+    raise
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Невалидни credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    
+def verify_token(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        token = None
+
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            try:
+                token = auth_header.split(" ")[1]
+            except IndexError:
+                return jsonify({'message': 'Invalid token format'}), 401
+        
+        if not token:
+            return jsonify({'message': 'Token is missing'}), 401
+
+        try:
+            r = requests.get(f"{KEYCLOAK_URL}/realms/{REALM_NAME}/.well-known/openid-configuration")
+            config = r.json()
+            jwks_uri = config['jwks_uri']
+            r = requests.get(jwks_uri)
+            public_key = r.json()['keys'][0]
+            
+            from jose import jwt
+            decoded_token = jwt.decode(
+                token,
+                public_key,
+                algorithms=['RS256'],
+                audience=CLIENT_ID
+            )
+            logger.info(f"Token verified successfully for user: {decoded_token.get('preferred_username')}")
+
+            return f(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Token verification failed: {str(e)}")
+            return jsonify({'message': 'Invalid token'}), 401
+        
+    return decorated_function
+
+@app.route('/')
+def home():
+    return jsonify({"message": "File Storage API is running"}), 200
+
+@app.route('/api/upload', methods=['POST'])
+@verify_token
+def upload_file():
     try:
-        response = requests.get(
-            f"{settings.KEYCLOAK_URL}/realms/{settings.KEYCLOAK_REALM}/protocol/openid-connect/userinfo",
-            headers={"Authorization": f"Bearer {token}"}
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+
+        file_id = secure_filename(file.filename)
+
+        file_content = file.read()
+        file_size = len(file_content)
+
+        minio_client.put_object(
+            BUCKET_NAME,
+            file_id,
+            io.BytesIO(file_content),
+            file_size
         )
         
-        if response.status_code != 200:
-            raise credentials_exception
-            
-        return response.json()
-    except Exception:
-        raise credentials_exception
+        logger.info(f"File uploaded successfully: {file_id}")
+        return jsonify({'message': 'File uploaded successfully', 'file_id': file_id})
+        
+    except Exception as e:
+        logger.error(f"Upload failed: {str(e)}")
+        return jsonify({'error': 'File upload failed'}), 500
 
-
-@app.on_event("startup")
-async def startup_event():
-    if not minio_client.bucket_exists(settings.MINIO_BUCKET):
-        minio_client.make_bucket(settings.MINIO_BUCKET)
-
-@app.route("/upload", methods=["POST"])
-@jwt_required()
-def upload_file():
-    if "file" not in request.files:
-        return jsonify({"error": "No file provided"}), 400
-    file = request.files["file"]
-    filename = secure_filename(file.filename)
-
-    try:
-        s3.upload_fileobj(file, app.config["S3_BUCKET"], filename)
-        return jsonify({"message": "File uploaded", "file_id": filename}), 201
-    except NoCredentialsError:
-        return jsonify({"error": "S3 credentials error"}), 500
-
-
-@app.route("/download/<file_id>", methods=["GET"])
-@jwt_required()
+@app.route('/api/download/<file_id>', methods=['GET'])
+@verify_token
 def download_file(file_id):
     try:
-        file_obj = s3.get_object(Bucket=app.config["S3_BUCKET"], Key=file_id)
-        return file_obj["Body"].read(), 200
-    except s3.exceptions.NoSuchKey:
-        return jsonify({"error": "File not found"}), 404
+        file_object = minio_client.get_object(BUCKET_NAME, file_id)
+        return send_file(io.BytesIO(file_object.read()), as_attachment=True, download_name=file_id)
+    except Exception as e:
+        logger.error(f"Download failed: {str(e)}")
+        return jsonify({'error': 'File not found or download failed'}), 404
 
-
-@app.route("/update/<file_id>", methods=["PUT"])
-@jwt_required()
+@app.route('/api/update/<file_id>', methods=['PUT'])
+@verify_token
 def update_file(file_id):
-    if "file" not in request.files:
-        return jsonify({"error": "No file provided"}), 400
-    file = request.files["file"]
-
     try:
-        s3.upload_fileobj(file, app.config["S3_BUCKET"], file_id)
-        return jsonify({"message": "File updated"}), 200
-    except NoCredentialsError:
-        return jsonify({"error": "S3 credentials error"}), 500
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
 
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
 
-@app.route("/delete/<file_id>", methods=["DELETE"])
-@jwt_required()
+        file_content = file.read()
+        file_size = len(file_content)
+
+        try:
+            minio_client.stat_object(BUCKET_NAME, file_id)
+        except Exception:
+            return jsonify({'error': 'File not found'}), 404
+
+        minio_client.put_object(
+            BUCKET_NAME,
+            file_id,
+            io.BytesIO(file_content),
+            file_size
+        )
+        
+        logger.info(f"File updated successfully: {file_id}")
+        return jsonify({'message': 'File updated successfully'})
+        
+    except Exception as e:
+        logger.error(f"Update failed: {str(e)}")
+        return jsonify({'error': 'File update failed'}), 500
+
+@app.route('/api/delete/<file_id>', methods=['DELETE'])
+@verify_token
 def delete_file(file_id):
     try:
-        s3.delete_object(Bucket=app.config["S3_BUCKET"], Key=file_id)
-        return jsonify({"message": "File deleted"}), 200
-    except s3.exceptions.NoSuchKey:
-        return jsonify({"error": "File not found"}), 404
-
-
-@app.route("/login", methods=["POST"])
-def login():
-    data = request.json
-    username = data.get("username")
-    password = data.get("password")
-
-
-    if username == "test" and password == "test":
-        access_token = create_access_token(identity=username)
-        return jsonify(access_token=access_token), 200
-
-    return jsonify({"error": "Invalid credentials"}), 401
-
-
-@app.post("/api/upload")
-async def upload_file(
-    file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user)
-):
-    file_id = str(uuid.uuid4())
-    try:
-        minio_client.put_object(
-            settings.MINIO_BUCKET,
-            file_id,
-            file.file,
-            file.size
-        )
-        return {"file_id": file_id}
+        try:
+            minio_client.stat_object(BUCKET_NAME, file_id)
+        except Exception:
+            return jsonify({'error': 'File not found'}), 404
+        
+        minio_client.remove_object(BUCKET_NAME, file_id)
+        
+        logger.info(f"File deleted successfully: {file_id}")
+        return jsonify({'message': 'File deleted successfully'})
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Delete failed: {str(e)}")
+        return jsonify({'error': 'File deletion failed'}), 500
 
-@app.get("/api/download/{file_id}")
-async def download_file(
-    file_id: str,
-    current_user: dict = Depends(get_current_user)
-):
-    try:
-        response = minio_client.get_object(settings.MINIO_BUCKET, file_id)
-        return response.read()
-    except Exception as e:
-        raise HTTPException(status_code=404, detail="Файлът не е намерен")
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Not found'}), 404
 
-@app.put("/api/update/{file_id}")
-async def update_file(
-    file_id: str,
-    file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user)
-):
-    try:
-        minio_client.remove_object(settings.MINIO_BUCKET, file_id)
-        minio_client.put_object(
-            settings.MINIO_BUCKET,
-            file_id,
-            file.file,
-            file.size
-        )
-        return {"message": "Файлът е обновен успешно"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/delete/{file_id}")
-async def delete_file(
-    file_id: str,
-    current_user: dict = Depends(get_current_user)
-):
-    try:
-        minio_client.remove_object(settings.MINIO_BUCKET, file_id)
-        return {"message": "Файлът е изтрит успешно"}
-    except Exception as e:
-        raise HTTPException(status_code=404, detail="Файлът не е намерен")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
